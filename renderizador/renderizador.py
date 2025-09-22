@@ -20,6 +20,8 @@ import gpu          # Simula os recursos de uma GPU
 import x3d          # Faz a leitura do arquivo X3D, gera o grafo de cena e faz traversal
 import scenegraph   # Imprime o grafo de cena no console
 
+import numpy as np
+
 LARGURA = 60  # Valor padrão para largura da tela
 ALTURA = 40   # Valor padrão para altura da tela
 
@@ -35,27 +37,42 @@ class Renderizador:
         self.image_file = "tela.png"
         self.scene = None
         self.framebuffers = {}
+        self.supersample_scale = 2
+        self.framebuffers = {}
 
     def setup(self):
         """Configura o sistema para a renderização."""
-        # Configurando color buffers para exibição na tela
+        # Create two FrameBuffer positions for SSAA
+        fbo = gpu.GPU.gen_framebuffers(2)
+        self.framebuffers["INTERNAL"] = fbo[0]
+        self.framebuffers["FRONT"] = fbo[1]
 
-        # Cria uma (1) posição de FrameBuffer na GPU
-        fbo = gpu.GPU.gen_framebuffers(1)
+        # Calculate the high-resolution rendering dimensions
+        render_width = self.width * self.supersample_scale
+        render_height = self.height * self.supersample_scale
 
-        # Define o atributo FRONT como o FrameBuffe principal
-        self.framebuffers["FRONT"] = fbo[0]
+        # Update the GL module's dimensions to match the high-resolution buffer.
+        # This ensures all drawing calculations operate in the correct coordinate space.
+        gl.GL.width = render_width
+        gl.GL.height = render_height
+        
+        # Configure and allocate the high-resolution INTERNAL buffer for drawing
+        gpu.GPU.framebuffer_storage(
+            self.framebuffers["INTERNAL"],
+            gpu.GPU.COLOR_ATTACHMENT,
+            gpu.GPU.RGB8,
+            render_width,
+            render_height
+        )
+        gpu.GPU.framebuffer_storage(
+            self.framebuffers["INTERNAL"],
+            gpu.GPU.DEPTH_ATTACHMENT,
+            gpu.GPU.DEPTH_COMPONENT32F,
+            render_width,
+            render_height
+        )
 
-        # Define que a posição criada será usada para desenho e leitura
-        gpu.GPU.bind_framebuffer(gpu.GPU.FRAMEBUFFER, self.framebuffers["FRONT"])
-        # Opções:
-        # - DRAW_FRAMEBUFFER: Faz o bind só para escrever no framebuffer
-        # - READ_FRAMEBUFFER: Faz o bind só para leitura no framebuffer
-        # - FRAMEBUFFER: Faz o bind para leitura e escrita no framebuffer
-
-        # Aloca memória no FrameBuffer para um tipo e tamanho especificado de buffer
-
-        # Memória de Framebuffer para canal de cores
+        # Configure and allocate the final-resolution FRONT buffer for display
         gpu.GPU.framebuffer_storage(
             self.framebuffers["FRONT"],
             gpu.GPU.COLOR_ATTACHMENT,
@@ -64,39 +81,14 @@ class Renderizador:
             self.height
         )
 
-        # Descomente as seguintes linhas se for usar um Framebuffer para profundidade
-        # gpu.GPU.framebuffer_storage(
-        #     self.framebuffers["FRONT"],
-        #     gpu.GPU.DEPTH_ATTACHMENT,
-        #     gpu.GPU.DEPTH_COMPONENT32F,
-        #     self.width,
-        #     self.height
-        # )
-    
-        # Opções:
-        # - COLOR_ATTACHMENT: alocações para as cores da imagem renderizada
-        # - DEPTH_ATTACHMENT: alocações para as profundidades da imagem renderizada
-        # Obs: Você pode chamar duas vezes a rotina com cada tipo de buffer.
-
-        # Tipos de dados:
-        # - RGB8: Para canais de cores (Vermelho, Verde, Azul) 8bits cada (0-255)
-        # - RGBA8: Para canais de cores (Vermelho, Verde, Azul, Transparência) 8bits cada (0-255)
-        # - DEPTH_COMPONENT16: Para canal de Profundidade de 16bits (half-precision) (0-65535)
-        # - DEPTH_COMPONENT32F: Para canal de Profundidade de 32bits (single-precision) (float)
-
-        # Define cor que ira apagar o FrameBuffer quando clear_buffer() invocado
         gpu.GPU.clear_color([0, 0, 0])
-
-        # Define a profundidade que ira apagar o FrameBuffer quando clear_buffer() invocado
-        # Assuma 1.0 o mais afastado e -1.0 o mais próximo da camera
         gpu.GPU.clear_depth(1.0)
-
-        # Definindo tamanho do Viewport para renderização
-        self.scene.viewport(width=self.width, height=self.height)
+        self.scene.viewport(width=render_width, height=render_height)
 
     def pre(self):
         """Rotinas pré renderização."""
-        # Função invocada antes do processo de renderização iniciar.
+
+        gpu.GPU.bind_framebuffer(gpu.GPU.FRAMEBUFFER, self.framebuffers["INTERNAL"])
 
         # Limpa o frame buffers atual
         gpu.GPU.clear_buffer()
@@ -107,15 +99,25 @@ class Renderizador:
 
     def pos(self):
         """Rotinas pós renderização."""
-        # Função invocada após o processo de renderização terminar.
+        # This is where the downsampling from the internal buffer to the front buffer happens.
+        
+        # Get the color data from the high-resolution buffer
+        supersampled_buffer = gpu.GPU.frame_buffer[self.framebuffers["INTERNAL"]].color
+        # Get the destination buffer's color data array
+        final_buffer = gpu.GPU.frame_buffer[self.framebuffers["FRONT"]].color
+        
+        scale = self.supersample_scale
 
-        # Essa é uma chamada conveniente para manipulação de buffers
-        # ao final da renderização de um frame. Como por exemplo, executar
-        # downscaling da imagem.
-
-        # Método para a troca dos buffers (NÃO IMPLEMENTADO)
-        # Esse método será utilizado na fase de implementação de animações
-        gpu.GPU.swap_buffers()
+        # Efficiently downsample using numpy array reshaping and mean calculation
+        # This averages every 2x2 block of pixels into a single pixel
+        reshaped = supersampled_buffer.reshape(self.height, scale, self.width, scale, 3)
+        final_image = reshaped.mean(axis=(1, 3)).astype(final_buffer.dtype)
+        
+        # Directly copy the final downsampled image into the FRONT Framebuffer's color array
+        final_buffer[:] = final_image
+        
+        # Ensure the FRONT buffer is set for reading by the display window
+        gpu.GPU.bind_framebuffer(gpu.GPU.READ_FRAMEBUFFER, self.framebuffers["FRONT"])
 
     def mapping(self):
         """Mapeamento de funções para as rotinas de renderização."""
