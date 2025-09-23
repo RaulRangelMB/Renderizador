@@ -36,7 +36,8 @@ class GL:
         GL.supersample_scale = supersample_scale
         GL.render_width = width * supersample_scale
         GL.render_height = height * supersample_scale
-        
+        GL.ambient_light = [0.2, 0.2, 0.2]  # Default ambient light
+
         # Reset matrices for a new render
         GL.matrix_stack = []
         GL.model_matrix = np.identity(4)
@@ -90,61 +91,48 @@ class GL:
         return (normal / norm).tolist() if norm > 0 else [0, 0, 1]
     
     @staticmethod
-    def _calculate_lighting(normal, material_colors):
+    def _calculate_lighting(normal, world_pos, material_colors):
         """
-        Calculates the final color of a vertex using the Phong reflection model.
+        Calculates the final color of a point using the Phong reflection model.
         """
-        # --- 1. Get Material Properties ---
-        # Get material properties from the dictionary, with defaults
         diffuse_color = material_colors.get("diffuseColor", [0.8, 0.8, 0.8])
         specular_color = material_colors.get("specularColor", [0.0, 0.0, 0.0])
         emissive_color = material_colors.get("emissiveColor", [0.0, 0.0, 0.0])
         shininess = material_colors.get("shininess", 0.2)
         ambient_intensity = material_colors.get("ambientIntensity", 0.2)
-        
-        # Start with the object's own emissive color
-        final_color = np.array(emissive_color)
-        
-        # Add the ambient light contribution
-        # This is a general, non-directional light
-        ambient_term = ambient_intensity * np.array(diffuse_color)
-        final_color += ambient_term
 
-        # Normalize the surface normal vector
+        if not GL.lights:
+            ambient_contribution = np.array(GL.ambient_light) * np.array(diffuse_color) * ambient_intensity
+            final_color = np.array(emissive_color) + ambient_contribution
+            return np.clip(final_color, 0.0, 1.0).tolist()
+        
+        ambient_contribution = np.array(GL.ambient_light) * np.array(diffuse_color) * ambient_intensity
+        final_color = np.array(emissive_color) + ambient_contribution
+
         normal = np.array(normal)
-        normal = normal / np.linalg.norm(normal)
+        norm_length = np.linalg.norm(normal)
+        if norm_length > 0: normal /= norm_length
 
-        # --- 2. Loop Through All Lights in the Scene ---
+        # The view vector is from the point on the surface to the camera
+        camera_pos = np.array(GL.eye)
+        view_dir = camera_pos - world_pos
+        view_dir /= np.linalg.norm(view_dir)
+
         for light in GL.lights:
             light_color = np.array(light['color'])
-            light_intensity = light['intensity']
-            
-            # Use a normalized vector pointing TOWARDS the light
             light_dir = -np.array(light['direction'])
-            light_dir = light_dir / np.linalg.norm(light_dir)
+            light_dir /= np.linalg.norm(light_dir)
 
-            # --- 3. Calculate Diffuse Component ---
-            # How much the surface is facing the light
             diffuse_factor = max(0.0, np.dot(normal, light_dir))
-            diffuse_term = light_intensity * light_color * np.array(diffuse_color) * diffuse_factor
+            diffuse_term = light['intensity'] * light_color * np.array(diffuse_color) * diffuse_factor
             
-            # --- 4. Calculate Specular Component (Blinn-Phong) ---
-            # The view vector is constant, pointing out of the screen from the camera
-            view_dir = np.array([0.0, 0.0, 1.0])
-            
-            # The halfway vector is more efficient for calculating highlights
             halfway_dir = (light_dir + view_dir) / np.linalg.norm(light_dir + view_dir)
-            
             specular_factor = pow(max(0.0, np.dot(normal, halfway_dir)), shininess * 128)
-            specular_term = light_intensity * light_color * np.array(specular_color) * specular_factor
+            specular_term = light['intensity'] * light_color * np.array(specular_color) * specular_factor
             
-            # --- 5. Add Contributions to Final Color ---
             final_color += (diffuse_term + specular_term)
 
-        # Clamp all color channels to the valid [0, 1] range
-        final_color = np.clip(final_color, 0.0, 1.0)
-        
-        return final_color.tolist()
+        return np.clip(final_color, 0.0, 1.0).tolist()
 
 
     @staticmethod
@@ -586,55 +574,101 @@ class GL:
         if not point or len(point) < 9:
             return
 
-        # Get material properties
+        def transform_vertex(v):
+            """Transforms a single vertex and returns all necessary data."""
+            vec4 = np.array([v[0], v[1], v[2], 1.0])
+            
+            # --- THIS IS THE FIX ---
+            # The full transformation must include the model, view, and projection matrices.
+            world_pos_vec = GL.model_matrix @ vec4
+            view_pos_vec = GL.view_matrix @ world_pos_vec
+            clip_pos = GL.projection_matrix @ view_pos_vec
+            
+            world_pos = world_pos_vec[:3]
+            
+            w_clip = clip_pos[3] if clip_pos[3] != 0 else 1.0
+            ndc_pos = clip_pos / w_clip
+            
+            x = int(round((ndc_pos[0] * 0.5 + 0.5) * GL.render_width))
+            y = int(round((1.0 - (ndc_pos[1] * 0.5 + 0.5)) * GL.render_height))
+            
+            return (x, y, ndc_pos[2], w_clip, world_pos)
+
+        def draw_filled_triangle(p0, p1, p2, world_normal):
+            """Robust rasterizer with per-pixel lighting, z-buffer, and blending."""
+            (x0, y0, z0, w0, world0), (x1, y1, z1, w1, world1), (x2, y2, z2, w2, world2) = p0, p1, p2
+            
+            min_x = max(0, int(math.floor(min(x0,x1,x2))))
+            max_x = min(GL.render_width - 1, int(math.ceil(max(x0,x1,x2))))
+            min_y = max(0, int(math.floor(min(y0,y1,y2))))
+            max_y = min(GL.render_height - 1, int(math.ceil(max(y0,y1,y2))))
+
+            def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
+            area = edge(x0, y0, x1, y1, x2, y2)
+            if abs(area) < 1e-6: return
+
+            if area < 0:
+                p1, p2 = p2, p1 # Swap full data tuples
+                (x1, y1, z1, w1, world1) = p1
+                (x2, y2, z2, w2, world2) = p2
+                area = -area
+
+            for x in range(min_x, max_x + 1):
+                for y in range(min_y, max_y + 1):
+                    px, py = x + 0.5, y + 0.5
+                    wA = edge(x1, y1, x2, y2, px, py)
+                    wB = edge(x2, y2, x0, y0, px, py)
+                    wC = edge(x0, y0, x1, y1, px, py)
+
+                    if wA >= 0 and wB >= 0 and wC >= 0:
+                        alpha, beta, gamma = wA/area, wB/area, wC/area
+                        z_interp_ndc = alpha*z0 + beta*z1 + gamma*z2
+                        depth_val = (z_interp_ndc + 1.0) * 0.5
+                        current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
+                        
+                        if depth_val < current_depth:
+                            world_pos_interp = alpha*world0 + beta*world1 + gamma*world2
+                            
+                            lit_color_float = GL._calculate_lighting(world_normal, world_pos_interp, colors)
+                            source_color = [int(c * 255) for c in lit_color_float]
+
+                            final_color = source_color
+                            if transparency > 0.0:
+                                alpha_val = 1.0 - transparency
+                                dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
+                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(source_color, dest_color)]
+                            
+                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
+                            gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
+
+        # --- MAIN LOGIC for triangleSet ---
         transparency = colors.get("transparency", 0.0)
 
-        full_transform = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix
-        view_model_transform = GL.view_matrix @ GL.model_matrix
-        
         for i in range(0, len(point), 9):
             v0, v1, v2 = point[i:i+3], point[i+3:i+6], point[i+6:i+9]
             
-            # --- 1. Calculate Normal and Final Color ---
-            # Calculate the normal in the object's local space
             local_normal = GL._calculate_triangle_normal(v0, v1, v2)
-
-            # Transform the normal into world space for lighting calculations
-            # (Using the 3x3 part of the model matrix for rotation)
-            world_normal_vec = GL.model_matrix[:3,:3] @ np.array(local_normal)
-            world_normal = (world_normal_vec / np.linalg.norm(world_normal_vec)).tolist()
-
-            # Call the lighting function to get the final color in [0, 1] range
-            lit_color_float = GL._calculate_lighting(world_normal, colors)
+            try: # Use inverse transpose, the mathematically correct way
+                upper_3x3 = GL.model_matrix[:3, :3]
+                normal_transform = np.linalg.inv(upper_3x3).T
+                world_normal = normal_transform @ np.array(local_normal)
+                world_normal /= np.linalg.norm(world_normal)
+            except np.linalg.LinAlgError:
+                world_normal = (GL.model_matrix[:3,:3] @ np.array(local_normal))
+                world_normal /= np.linalg.norm(world_normal)
             
-            # Convert color to [0, 255] for drawing
-            final_color_tuple = [int(c * 255) for c in lit_color_float]
+            p0_data = transform_vertex(v0)
+            p1_data = transform_vertex(v1)
+            p2_data = transform_vertex(v2)
             
-            # --- 2. Transform Vertices ---
-            v0_h, v1_h, v2_h = np.array(v0+[1.0]), np.array(v1+[1.0]), np.array(v2+[1.0])
-
-            p0_clip, p1_clip, p2_clip = full_transform@v0_h, full_transform@v1_h, full_transform@v2_h
-            
-            if p0_clip[3]==0 or p1_clip[3]==0 or p2_clip[3]==0: continue
-            p0_ndc, p1_ndc, p2_ndc = p0_clip/p0_clip[3], p1_clip/p1_clip[3], p2_clip/p2_clip[3]
-            
-            sx0, sy0 = int((p0_ndc[0]+1)*0.5*GL.render_width), int((1-p0_ndc[1])*0.5*GL.render_height)
-            sx1, sy1 = int((p1_ndc[0]+1)*0.5*GL.render_width), int((1-p1_ndc[1])*0.5*GL.render_height)
-            sx2, sy2 = int((p2_ndc[0]+1)*0.5*GL.render_width), int((1-p2_ndc[1])*0.5*GL.render_height)
-            
-            p0_final = (sx0, sy0, p0_ndc[2], p0_clip[3])
-            p1_final = (sx1, sy1, p1_ndc[2], p1_clip[3])
-            p2_final = (sx2, sy2, p2_ndc[2], p2_clip[3])
-            
-            # --- 3. Draw the Triangle ---
-            # Pass the new, calculated lit color to the rasterizer
-            GL._draw_triangle_simple(p0_final, p1_final, p2_final, final_color_tuple, transparency)
+            draw_filled_triangle(p0_data, p1_data, p2_data, world_normal.tolist())
 
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
         """Sets up the view and projection matrices based on camera properties."""
-        eye = np.array(position)
+        GL.eye = np.array(position)
+        eye = GL.eye
         
         # Create rotation matrix from axis-angle to find camera direction
         x, y, z, angle = orientation
@@ -787,47 +821,90 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        if not point or not index: return
+        if not point or not index:
+            return
 
-        emissive_color = colors["emissiveColor"]
-        color_tuple = [c * 255 for c in emissive_color]
-        
+        # --- SETUP ---
+        transparency = colors.get("transparency", 0.0)
         verts = [point[i:i+3] for i in range(0, len(point), 3)]
         
-        full_transform = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix
-        view_model_transform = GL.view_matrix @ GL.model_matrix
-        
+        # --- NESTED HELPER FUNCTIONS ---
+        # (These helpers are identical to the ones in the corrected triangleSet)
+
+        def transform_vertex(v):
+            """Transforms a single vertex and returns all necessary data."""
+            vec4 = np.array([v[0], v[1], v[2], 1.0])
+            world_pos = (GL.model_matrix @ vec4)[:3]
+            clip_pos = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix @ vec4
+            w_clip = clip_pos[3] if clip_pos[3] != 0 else 1.0
+            ndc_pos = clip_pos / w_clip
+            x = int(round((ndc_pos[0] * 0.5 + 0.5) * GL.render_width))
+            y = int(round((1.0 - (ndc_pos[1] * 0.5 + 0.5)) * GL.render_height))
+            return (x, y, ndc_pos[2], w_clip, world_pos)
+
+        def draw_filled_triangle(p0, p1, p2, world_normal):
+            """Robust rasterizer with per-pixel lighting, z-buffer, and blending."""
+            (x0, y0, z0, w0, world0), (x1, y1, z1, w1, world1), (x2, y2, z2, w2, world2) = p0, p1, p2
+            min_x = max(0, int(math.floor(min(x0,x1,x2))))
+            max_x = min(GL.render_width - 1, int(math.ceil(max(x0,x1,x2))))
+            min_y = max(0, int(math.floor(min(y0,y1,y2))))
+            max_y = min(GL.render_height - 1, int(math.ceil(max(y0,y1,y2))))
+            def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
+            area = edge(x0, y0, x1, y1, x2, y2)
+            if abs(area) < 1e-6: return
+            if area < 0:
+                p1, p2 = p2, p1
+                (x1, y1, z1, w1, world1) = p1; (x2, y2, z2, w2, world2) = p2
+                area = -area
+            for x in range(min_x, max_x + 1):
+                for y in range(min_y, max_y + 1):
+                    px, py = x + 0.5, y + 0.5
+                    wA = edge(x1, y1, x2, y2, px, py); wB = edge(x2, y2, x0, y0, px, py); wC = edge(x0, y0, x1, y1, px, py)
+                    if wA >= 0 and wB >= 0 and wC >= 0:
+                        alpha, beta, gamma = wA/area, wB/area, wC/area
+                        z_interp_ndc = alpha*z0 + beta*z1 + gamma*z2
+                        depth_val = (z_interp_ndc + 1.0) * 0.5
+                        current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
+                        if depth_val < current_depth:
+                            world_pos_interp = alpha*world0 + beta*world1 + gamma*world2
+                            lit_color_float = GL._calculate_lighting(world_normal, world_pos_interp, colors)
+                            source_color = [int(c * 255) for c in lit_color_float]
+                            final_color = source_color
+                            if transparency > 0.0:
+                                alpha_val = 1.0 - transparency
+                                dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
+                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(source_color, dest_color)]
+                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
+                            gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
+
+        # --- MAIN LOGIC for indexedTriangleStripSet ---
         current_strip = []
         for idx in index:
             if idx == -1:
                 if len(current_strip) >= 3:
                     for i in range(len(current_strip) - 2):
                         i0, i1, i2 = current_strip[i], current_strip[i+1], current_strip[i+2]
+                        
+                        # Ensure correct winding order for strips
                         v_indices = (i0, i1, i2) if i % 2 == 0 else (i0, i2, i1)
                         
                         v0, v1, v2 = verts[v_indices[0]], verts[v_indices[1]], verts[v_indices[2]]
-                        v0_h, v1_h, v2_h = np.array(v0+[1.0]), np.array(v1+[1.0]), np.array(v2+[1.0])
-
-                        z_cam0 = -(view_model_transform @ v0_h)[2]
-                        z_cam1 = -(view_model_transform @ v1_h)[2]
-                        z_cam2 = -(view_model_transform @ v2_h)[2]
-                        if z_cam0 < GL.near or z_cam1 < GL.near or z_cam2 < GL.near: continue
                         
-                        p0_clip, p1_clip, p2_clip = full_transform@v0_h, full_transform@v1_h, full_transform@v2_h
+                        local_normal = GL._calculate_triangle_normal(v0, v1, v2)
+                        try:
+                            upper_3x3 = GL.model_matrix[:3, :3]
+                            normal_transform = np.linalg.inv(upper_3x3).T
+                            world_normal = normal_transform @ np.array(local_normal)
+                            world_normal /= np.linalg.norm(world_normal)
+                        except np.linalg.LinAlgError:
+                            world_normal = (GL.model_matrix[:3,:3] @ np.array(local_normal))
+                            world_normal /= np.linalg.norm(world_normal)
+                            
+                        p0_data = transform_vertex(v0)
+                        p1_data = transform_vertex(v1)
+                        p2_data = transform_vertex(v2)
 
-                        if p0_clip[3]==0 or p1_clip[3]==0 or p2_clip[3]==0: continue
-                        p0_ndc, p1_ndc, p2_ndc = p0_clip/p0_clip[3], p1_clip/p1_clip[3], p2_clip/p2_clip[3]
-
-                        sx0, sy0 = int((p0_ndc[0]+1)*0.5*GL.render_width), int((1-p0_ndc[1])*0.5*GL.render_height)
-                        sx1, sy1 = int((p1_ndc[0]+1)*0.5*GL.render_width), int((1-p1_ndc[1])*0.5*GL.render_height)
-                        sx2, sy2 = int((p2_ndc[0]+1)*0.5*GL.render_width), int((1-p2_ndc[1])*0.5*GL.render_height)
-                        
-                        p0_final = (sx0, sy0, p0_ndc[2], p0_clip[3])
-                        p1_final = (sx1, sy1, p1_ndc[2], p1_clip[3])
-                        p2_final = (sx2, sy2, p2_ndc[2], p2_clip[3])
-
-                        GL._draw_triangle_simple(p0_final, p1_final, p2_final, color_tuple, 0)
-
+                        draw_filled_triangle(p0_data, p1_data, p2_data, world_normal.tolist())
                 current_strip = []
             else:
                 current_strip.append(idx)
@@ -1001,11 +1078,15 @@ class GL:
         # que emana da fonte de luz no sistema de coordenadas local. A luz é emitida ao
         # longo de raios paralelos de uma distância infinita.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("DirectionalLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("DirectionalLight : color = {0}".format(color)) # imprime no terminal
-        print("DirectionalLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("DirectionalLight : direction = {0}".format(direction)) # imprime no terminal
+        norm_direction = direction / np.linalg.norm(direction) if np.linalg.norm(direction) != 0 else direction
+
+        GL.lights.append({
+            'type': 'directional',
+            'ambientIntensity': ambientIntensity,
+            'color': color,
+            'intensity': intensity,
+            'direction': norm_direction.tolist()
+        })
 
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
