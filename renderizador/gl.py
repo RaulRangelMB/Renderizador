@@ -24,6 +24,7 @@ class GL:
     supersample_scale = 2
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
+    lights = []   # lista de luzes na cena
 
     @staticmethod
     def setup(width, height, near=0.01, far=1000, supersample_scale=2):
@@ -73,6 +74,77 @@ class GL:
         z_ndc = vec_ndc[2]
 
         return (x, y, z_ndc, w_clip)
+    
+    @staticmethod
+    def _calculate_triangle_normal(v0, v1, v2):
+        """Calculates the normal vector of a triangle using the cross product."""
+        # Create two edge vectors from the vertices
+        edge1 = np.array(v1) - np.array(v0)
+        edge2 = np.array(v2) - np.array(v0)
+        
+        # The cross product gives a perpendicular vector (the normal)
+        normal = np.cross(edge1, edge2)
+        
+        # Normalize the vector to have a length of 1
+        norm = np.linalg.norm(normal)
+        return (normal / norm).tolist() if norm > 0 else [0, 0, 1]
+    
+    @staticmethod
+    def _calculate_lighting(normal, material_colors):
+        """
+        Calculates the final color of a vertex using the Phong reflection model.
+        """
+        # --- 1. Get Material Properties ---
+        # Get material properties from the dictionary, with defaults
+        diffuse_color = material_colors.get("diffuseColor", [0.8, 0.8, 0.8])
+        specular_color = material_colors.get("specularColor", [0.0, 0.0, 0.0])
+        emissive_color = material_colors.get("emissiveColor", [0.0, 0.0, 0.0])
+        shininess = material_colors.get("shininess", 0.2)
+        ambient_intensity = material_colors.get("ambientIntensity", 0.2)
+        
+        # Start with the object's own emissive color
+        final_color = np.array(emissive_color)
+        
+        # Add the ambient light contribution
+        # This is a general, non-directional light
+        ambient_term = ambient_intensity * np.array(diffuse_color)
+        final_color += ambient_term
+
+        # Normalize the surface normal vector
+        normal = np.array(normal)
+        normal = normal / np.linalg.norm(normal)
+
+        # --- 2. Loop Through All Lights in the Scene ---
+        for light in GL.lights:
+            light_color = np.array(light['color'])
+            light_intensity = light['intensity']
+            
+            # Use a normalized vector pointing TOWARDS the light
+            light_dir = -np.array(light['direction'])
+            light_dir = light_dir / np.linalg.norm(light_dir)
+
+            # --- 3. Calculate Diffuse Component ---
+            # How much the surface is facing the light
+            diffuse_factor = max(0.0, np.dot(normal, light_dir))
+            diffuse_term = light_intensity * light_color * np.array(diffuse_color) * diffuse_factor
+            
+            # --- 4. Calculate Specular Component (Blinn-Phong) ---
+            # The view vector is constant, pointing out of the screen from the camera
+            view_dir = np.array([0.0, 0.0, 1.0])
+            
+            # The halfway vector is more efficient for calculating highlights
+            halfway_dir = (light_dir + view_dir) / np.linalg.norm(light_dir + view_dir)
+            
+            specular_factor = pow(max(0.0, np.dot(normal, halfway_dir)), shininess * 128)
+            specular_term = light_intensity * light_color * np.array(specular_color) * specular_factor
+            
+            # --- 5. Add Contributions to Final Color ---
+            final_color += (diffuse_term + specular_term)
+
+        # Clamp all color channels to the valid [0, 1] range
+        final_color = np.clip(final_color, 0.0, 1.0)
+        
+        return final_color.tolist()
 
 
     @staticmethod
@@ -273,42 +345,39 @@ class GL:
     
     @staticmethod
     def _draw_triangle_simple(p0, p1, p2, color_tuple, transparency):
-        """A simple rasterizer for single-color triangles with Z-buffering and transparency."""
-        (x0,y0,z0,_), (x1,y1,z1,_), (x2,y2,z2,_) = p0, p1, p2
-        
-        min_x = max(0, int(min(x0, x1, x2)))
-        max_x = min(GL.render_width - 1, int(max(x0, x1, x2)))
-        min_y = max(0, int(min(y0, y1, y2)))
-        max_y = min(GL.render_height - 1, int(max(y0, y1, y2)))
+            (x0,y0,z0,_), (x1,y1,z1,_), (x2,y2,z2,_) = p0, p1, p2
+            
+            min_x = max(0, int(min(x0, x1, x2)))
+            max_x = min(GL.render_width - 1, int(max(x0, x1, x2)))
+            min_y = max(0, int(min(y0, y1, y2)))
+            max_y = min(GL.render_height - 1, int(max(y0, y1, y2)))
 
-        def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
-        area = edge(x0,y0,x1,y1,x2,y2)
-        if abs(area) < 1e-6: return
+            def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
+            area = edge(x0,y0,x1,y1,x2,y2)
+            if abs(area) < 1e-6: return
 
-        for x in range(min_x, max_x + 1):
-            for y in range(min_y, max_y + 1):
-                wA, wB, wC = edge(x1,y1,x2,y2,x,y), edge(x2,y2,x0,y0,x,y), edge(x0,y0,x1,y1,x,y)
-                is_inside = (wA >= 0 and wB >= 0 and wC >= 0) or (wA <= 0 and wB <= 0 and wC <= 0)
-                
-                if is_inside:
-                    alpha, beta, gamma = wA/area, wB/area, wC/area
-                    z_interp = alpha * z0 + beta * z1 + gamma * z2
-                    current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-
-                    if z_interp < current_depth:
-                        # Depth test passed, always update Z-buffer
-                        gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [z_interp])
+            for x in range(min_x, max_x + 1):
+                for y in range(min_y, max_y + 1):
+                    wA, wB, wC = edge(x1,y1,x2,y2,x,y), edge(x2,y2,x0,y0,x,y), edge(x0,y0,x1,y1,x,y)
+                    is_inside = (wA >= 0 and wB >= 0 and wC >= 0) or (wA <= 0 and wB <= 0 and wC <= 0)
+                    
+                    if is_inside:
+                        alpha, beta, gamma = wA/area, wB/area, wC/area
+                        z_interp_ndc = alpha * z0 + beta * z1 + gamma * z2
                         
-                        # --- ALPHA BLENDING LOGIC ---
-                        if transparency > 0.0:
-                            alpha_val = 1.0 - transparency
-                            dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
+                        depth_val = (z_interp_ndc + 1.0) * 0.5
+                        current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
+
+                        if depth_val < current_depth:
+                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
                             
-                            # Blend: Final = Source*Alpha + Dest*(1-Alpha)
-                            final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(color_tuple, dest_color)]
+                            final_color = color_tuple
+                            if transparency > 0.0:
+                                alpha_val = 1.0 - transparency
+                                dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
+                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(color_tuple, dest_color)]
+                            
                             gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
-                        else: # Opaque
-                            gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, color_tuple)
 
 
     @staticmethod
@@ -518,21 +587,31 @@ class GL:
             return
 
         # Get material properties
-        emissive_color = colors["emissiveColor"]
-        default_color_tuple = [c * 255 for c in emissive_color]
         transparency = colors.get("transparency", 0.0)
 
         full_transform = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix
         view_model_transform = GL.view_matrix @ GL.model_matrix
-
+        
         for i in range(0, len(point), 9):
             v0, v1, v2 = point[i:i+3], point[i+3:i+6], point[i+6:i+9]
-            v0_h, v1_h, v2_h = np.array(v0+[1.0]), np.array(v1+[1.0]), np.array(v2+[1.0])
+            
+            # --- 1. Calculate Normal and Final Color ---
+            # Calculate the normal in the object's local space
+            local_normal = GL._calculate_triangle_normal(v0, v1, v2)
 
-            z_cam0 = -(view_model_transform @ v0_h)[2]
-            z_cam1 = -(view_model_transform @ v1_h)[2]
-            z_cam2 = -(view_model_transform @ v2_h)[2]
-            if z_cam0 < GL.near or z_cam1 < GL.near or z_cam2 < GL.near: continue
+            # Transform the normal into world space for lighting calculations
+            # (Using the 3x3 part of the model matrix for rotation)
+            world_normal_vec = GL.model_matrix[:3,:3] @ np.array(local_normal)
+            world_normal = (world_normal_vec / np.linalg.norm(world_normal_vec)).tolist()
+
+            # Call the lighting function to get the final color in [0, 1] range
+            lit_color_float = GL._calculate_lighting(world_normal, colors)
+            
+            # Convert color to [0, 255] for drawing
+            final_color_tuple = [int(c * 255) for c in lit_color_float]
+            
+            # --- 2. Transform Vertices ---
+            v0_h, v1_h, v2_h = np.array(v0+[1.0]), np.array(v1+[1.0]), np.array(v2+[1.0])
 
             p0_clip, p1_clip, p2_clip = full_transform@v0_h, full_transform@v1_h, full_transform@v2_h
             
@@ -547,7 +626,9 @@ class GL:
             p1_final = (sx1, sy1, p1_ndc[2], p1_clip[3])
             p2_final = (sx2, sy2, p2_ndc[2], p2_clip[3])
             
-            GL._draw_triangle_simple(p0_final, p1_final, p2_final, default_color_tuple, transparency)
+            # --- 3. Draw the Triangle ---
+            # Pass the new, calculated lit color to the rasterizer
+            GL._draw_triangle_simple(p0_final, p1_final, p2_final, final_color_tuple, transparency)
 
 
     @staticmethod
@@ -900,8 +981,15 @@ class GL:
         # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
         # ambientIntensity = 0,0 e direção = (0 0 −1).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("NavigationInfo : headlight = {0}".format(headlight)) # imprime no terminal
+        if headlight:
+            headlight_info = {
+                'type': 'directional', # A headlight acts like a directional light
+                'color': [1.0, 1.0, 1.0],
+                'intensity': 1.0,
+                'ambientIntensity': 0.0,
+                'direction': [0.0, 0.0, -1.0] # Shines straight ahead in view space
+            }
+            GL.lights.append(headlight_info)
 
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
