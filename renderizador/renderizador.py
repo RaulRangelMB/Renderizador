@@ -82,7 +82,7 @@ class Renderizador:
         )
 
         gpu.GPU.clear_color([0, 0, 0])
-        gpu.GPU.clear_depth(1.0)
+        
         self.scene.viewport(width=render_width, height=render_height)
 
     def pre(self):
@@ -92,6 +92,8 @@ class Renderizador:
 
         # Limpa o frame buffers atual
         gpu.GPU.clear_buffer()
+
+        gpu.GPU.clear_depth(-1)
 
         # Recursos que podem ser úteis:
         # Define o valor do pixel no framebuffer: draw_pixel(coord, mode, data)

@@ -38,43 +38,11 @@ class GL:
         GL.render_height = height * supersample_scale
         GL.ambient_light = [0.2, 0.2, 0.2]  # Default ambient light
 
-        # Reset matrices for a new render
         GL.matrix_stack = []
         GL.model_matrix = np.identity(4)
         GL.view_matrix = np.identity(4)
         GL.projection_matrix = np.identity(4)
 
-
-    @staticmethod
-    def _transform_vertex(vertex):
-        """Transforms a 3D vertex to 2D screen coordinates and preserves Z and W."""
-        vec = np.array([vertex[0], vertex[1], vertex[2], 1.0])
-
-        # Apply model, view, and projection matrices
-        if hasattr(GL, "model_matrix"):
-            vec = GL.model_matrix @ vec
-        if hasattr(GL, "view_matrix"):
-            vec = GL.view_matrix @ vec
-        if hasattr(GL, "projection_matrix"):
-            vec = GL.projection_matrix @ vec
-
-        # Store w from clip space, it's needed for perspective correction
-        w_clip = vec[3]
-
-        # Perspective divide to get Normalized Device Coordinates (NDC)
-        if w_clip != 0:
-            vec_ndc = vec / w_clip
-        else:
-            vec_ndc = vec
-
-        # NDC → screen coordinates
-        x = int((vec_ndc[0] * 0.5 + 0.5) * (GL.render_width - 1))
-        y = int((vec_ndc[1] * 0.5 + 0.5) * (GL.render_height - 1))
-        
-        # The Z value in NDC is used for the depth buffer
-        z_ndc = vec_ndc[2]
-
-        return (x, y, z_ndc, w_clip)
     
     @staticmethod
     def _calculate_triangle_normal(v0, v1, v2):
@@ -134,181 +102,25 @@ class GL:
 
         return np.clip(final_color, 0.0, 1.0).tolist()
 
-
     @staticmethod
-    def _draw_inside_triangle(p0, p1, p2, emissive_color):
-        """Draws a filled triangle using scanline rasterization with edge functions."""
-        v0_x, v0_y = p0
-        v1_x, v1_y = p1
-        v2_x, v2_y = p2
-
-        # Bounding box
-        min_x, max_x = min(v0_x, v1_x, v2_x), max(v0_x, v1_x, v2_x)
-        min_y, max_y = min(v0_y, v1_y, v2_y), max(v0_y, v1_y, v2_y)
-
-        def edge_func(ax, ay, bx, by, px, py):
-            return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
-
-        for x in range(min_x, max_x + 1):
-            for y in range(min_y, max_y + 1):
-                w0 = edge_func(v1_x, v1_y, v2_x, v2_y, x, y)
-                w1 = edge_func(v2_x, v2_y, v0_x, v0_y, x, y)
-                w2 = edge_func(v0_x, v0_y, v1_x, v1_y, x, y)
-
-                # Check if pixel is inside the triangle
-                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
-                    if 0 <= x < GL.render_width and 0 <= y < GL.render_height:
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8,
-                                [emissive_color[0] * 255,
-                                emissive_color[1] * 255,
-                                emissive_color[2] * 255])
-
-
-    @staticmethod
-    def _draw_inside_triangle_color_and_tex(p0, p1, p2, c0, c1, c2, uv0, uv1, uv2, texture_img, default_color_tuple, transparency):
-        """Draws a triangle with Z-buffering, alpha blending, and perspective-correct interpolation."""
-        (x0, y0, z0, w_clip0) = p0
-        (x1, y1, z1, w_clip1) = p1
-        (x2, y2, z2, w_clip2) = p2
-
-        min_x = max(0, int(min(x0, x1, x2)))
-        max_x = min(GL.render_width - 1, int(max(x0, x1, x2)))
-        min_y = max(0, int(min(y0, y1, y2)))
-        max_y = min(GL.render_height - 1, int(max(y0, y1, y2)))
-
-        def edge_func(ax, ay, bx, by, px, py):
-            return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
-
-        area = edge_func(x0, y0, x1, y1, x2, y2)
-        if area == 0:
-            return
-
-        one_over_w0 = 1.0 / w_clip0 if w_clip0 != 0 else 0
-        one_over_w1 = 1.0 / w_clip1 if w_clip1 != 0 else 0
-        one_over_w2 = 1.0 / w_clip2 if w_clip2 != 0 else 0
-
-        for x in range(min_x, max_x + 1):
-            for y in range(min_y, max_y + 1):
-                w0_bary = edge_func(x1, y1, x2, y2, x, y)
-                w1_bary = edge_func(x2, y2, x0, y0, x, y)
-                w2_bary = edge_func(x0, y0, x1, y1, x, y)
-
-                is_inside = (w0_bary >= 0 and w1_bary >= 0 and w2_bary >= 0) or \
-                            (w0_bary <= 0 and w1_bary <= 0 and w2_bary <= 0)
-
-                if is_inside:
-                    b0, b1, b2 = w0_bary / area, w1_bary / area, w2_bary / area
-
-                    interp_one_over_w = b0 * one_over_w0 + b1 * one_over_w1 + b2 * one_over_w2
-                    if abs(interp_one_over_w) < 1e-9:
-                        continue
-
-                    z_over_w = b0 * z0 * one_over_w0 + b1 * z1 * one_over_w1 + b2 * z2 * one_over_w2
-                    z_interp = z_over_w / interp_one_over_w
-                    current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-                    
-                    if z_interp < current_depth:
-                        # The depth test passed. Update the Z-buffer IMMEDIATELY for ALL objects.
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F, [z_interp])
-
-                        # Now, calculate the pixel's color
-                        source_color = default_color_tuple
-                        if texture_img is not None and all(uv is not None for uv in [uv0, uv1, uv2]):
-                            u_over_w = b0*uv0[0]*one_over_w0 + b1*uv1[0]*one_over_w1 + b2*uv2[0]*one_over_w2
-                            v_over_w = b0*uv0[1]*one_over_w0 + b1*uv1[1]*one_over_w1 + b2*uv2[1]*one_over_w2
-                            u, v = u_over_w / interp_one_over_w, v_over_w / interp_one_over_w
-                            h, w, _ = texture_img.shape
-                            tex_x, tex_y = int(v * (w - 1)), int((1 - u) * (h - 1))
-                            px = texture_img[max(0, min(tex_y, h - 1)), max(0, min(tex_x, w - 1))]
-                            source_color = [int(px[0]), int(px[1]), int(px[2])]
-                        elif all(c is not None for c in [c0, c1, c2]):
-                            r_over_w = b0*c0[0]*one_over_w0 + b1*c1[0]*one_over_w1 + b2*c2[0]*one_over_w2
-                            g_over_w = b0*c0[1]*one_over_w0 + b1*c1[1]*one_over_w1 + b2*c2[1]*one_over_w2
-                            b_over_w = b0*c0[2]*one_over_w0 + b1*c1[2]*one_over_w1 + b2*c2[2]*one_over_w2
-                            r, g, b = r_over_w / interp_one_over_w, g_over_w / interp_one_over_w, b_over_w / interp_one_over_w
-                            source_color = [int(r * 255), int(g * 255), int(b * 255)]
-
-                        # Now, determine if blending is needed for the color
-                        alpha = 1.0 - transparency
-                        if alpha < 1.0: # Is the object transparent?
-                            dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
-                            final_r = source_color[0] * alpha + dest_color[0] * (1.0 - alpha)
-                            final_g = source_color[1] * alpha + dest_color[1] * (1.0 - alpha)
-                            final_b = source_color[2] * alpha + dest_color[2] * (1.0 - alpha)
-                            gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, [final_r, final_g, final_b])
-                        else: # The object is opaque
-                            gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, source_color)
-
-
-    @staticmethod
-    def _draw_line(p0, p1, emissive_color):
-        """Draws a line between two points using Bresenham's algorithm."""
-        x0, y0 = p0
-        x1, y1 = p1
-
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-
-        while True:
-            if 0 <= x0 < GL.render_width and 0 <= y0 < GL.render_height:
-                gpu.GPU.draw_pixel([x0, y0], gpu.GPU.RGB8, [emissive_color[0] * 255, emissive_color[1] * 255, emissive_color[2] * 255])
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
-
-    @staticmethod
-    def _draw_line_3d(p0_data, p1_data, emissive_color):
-        """Draws a line between two 3D-transformed points with Z-buffering."""
-        (x0, y0, z0, w0) = p0_data
-        (x1, y1, z1, w1) = p1_data
-
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
+    def _transform_vertex(v):
+        """Transforms a single vertex and returns all necessary data."""
+        vec4 = np.array([v[0], v[1], v[2], 1.0])
         
-        # Determine the total number of steps for interpolation
-        steps = max(dx, dy)
-        if steps == 0:
-            return
-
-        # Bresenham's algorithm main loop
-        while True:
-            # Check if the current pixel is within the framebuffer bounds
-            if 0 <= x0 < GL.render_width and 0 <= y0 < GL.render_height:
-                # Interpolate Z value along the line
-                # Heuristic: use distance from start point as a simple interpolation factor
-                dist_from_start = max(abs(x0 - p0_data[0]), abs(y0 - p0_data[1]))
-                t = dist_from_start / steps if steps > 0 else 0.0
-                z_interp = z0 * (1.0 - t) + z1 * t
-
-                # Depth Test
-                current_depth = gpu.GPU.read_pixel([x0, y0], gpu.GPU.DEPTH_COMPONENT32F)[0]
-                if z_interp < current_depth:
-                    # If test passes, update depth and color buffers
-                    gpu.GPU.draw_pixel([x0, y0], gpu.GPU.DEPTH_COMPONENT32F, [z_interp])
-                    gpu.GPU.draw_pixel([x0, y0], gpu.GPU.RGB8, [emissive_color[0] * 255, emissive_color[1] * 255, emissive_color[2] * 255])
-
-            # Break condition for the loop
-            if x0 == x1 and y0 == y1:
-                break
-
-            # Bresenham's algorithm step
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
+        # The full transformation must include the model, view, and projection matrices.
+        world_pos_vec = GL.model_matrix @ vec4
+        view_pos_vec = GL.view_matrix @ world_pos_vec
+        clip_pos = GL.projection_matrix @ view_pos_vec
+        
+        world_pos = world_pos_vec[:3]
+        
+        w_clip = clip_pos[3] if clip_pos[3] != 0 else 1.0
+        ndc_pos = clip_pos / w_clip
+        
+        x = int(round((ndc_pos[0] * 0.5 + 0.5) * GL.render_width))
+        y = int(round((1.0 - (ndc_pos[1] * 0.5 + 0.5)) * GL.render_height))
+        
+        return (x, y, ndc_pos[2], w_clip, world_pos)
 
     @staticmethod
     def _choose_mip_level(p0, p1, p2, uv0, uv1, uv2, base_texture, num_levels):
@@ -332,39 +144,52 @@ class GL:
         return max(0, min(level, num_levels - 1))
     
     @staticmethod
-    def _draw_triangle_simple(p0, p1, p2, color_tuple, transparency):
-            (x0,y0,z0,_), (x1,y1,z1,_), (x2,y2,z2,_) = p0, p1, p2
+    def _draw_triangle(p0, p1, p2, colors, world_normal):
+            (x0, y0, z0, w0, world0), (x1, y1, z1, w1, world1), (x2, y2, z2, w2, world2) = p0, p1, p2
+
+            transparency = colors.get("transparency", 0.0)
             
-            min_x = max(0, int(min(x0, x1, x2)))
-            max_x = min(GL.render_width - 1, int(max(x0, x1, x2)))
-            min_y = max(0, int(min(y0, y1, y2)))
-            max_y = min(GL.render_height - 1, int(max(y0, y1, y2)))
+            min_x = max(0, int(math.floor(min(x0,x1,x2))))
+            max_x = min(GL.render_width - 1, int(math.ceil(max(x0,x1,x2))))
+            min_y = max(0, int(math.floor(min(y0,y1,y2))))
+            max_y = min(GL.render_height - 1, int(math.ceil(max(y0,y1,y2))))
 
             def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
-            area = edge(x0,y0,x1,y1,x2,y2)
+            area = edge(x0, y0, x1, y1, x2, y2)
             if abs(area) < 1e-6: return
+
+            if area < 0:
+                p1, p2 = p2, p1
+                (x1, y1, z1, w1, world1) = p1
+                (x2, y2, z2, w2, world2) = p2
+                area = -area
 
             for x in range(min_x, max_x + 1):
                 for y in range(min_y, max_y + 1):
-                    wA, wB, wC = edge(x1,y1,x2,y2,x,y), edge(x2,y2,x0,y0,x,y), edge(x0,y0,x1,y1,x,y)
-                    is_inside = (wA >= 0 and wB >= 0 and wC >= 0) or (wA <= 0 and wB <= 0 and wC <= 0)
-                    
-                    if is_inside:
+                    px, py = x + 0.5, y + 0.5
+                    wA = edge(x1, y1, x2, y2, px, py)
+                    wB = edge(x2, y2, x0, y0, px, py)
+                    wC = edge(x0, y0, x1, y1, px, py)
+
+                    if wA >= 0 and wB >= 0 and wC >= 0:
                         alpha, beta, gamma = wA/area, wB/area, wC/area
-                        z_interp_ndc = alpha * z0 + beta * z1 + gamma * z2
-                        
+                        z_interp_ndc = alpha*z0 + beta*z1 + gamma*z2
                         depth_val = (z_interp_ndc + 1.0) * 0.5
                         current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-
+                        
                         if depth_val < current_depth:
-                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
+                            world_pos_interp = alpha*world0 + beta*world1 + gamma*world2
                             
-                            final_color = color_tuple
+                            lit_color_float = GL._calculate_lighting(world_normal, world_pos_interp, colors)
+                            source_color = [int(c * 255) for c in lit_color_float]
+
+                            final_color = source_color
                             if transparency > 0.0:
                                 alpha_val = 1.0 - transparency
                                 dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
-                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(color_tuple, dest_color)]
+                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(source_color, dest_color)]
                             
+                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
                             gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
 
 
@@ -392,7 +217,7 @@ class GL:
                 if is_inside:
                     alpha, beta, gamma = wA/area, wB/area, wC/area
                     
-                    z_interp = alpha * z0 + beta * z1 + gamma * z2
+                    z_interp = 1.0 / ((alpha/z0) + (beta/z1) + (gamma/z2))
                     current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
 
                     if z_interp < current_depth:
@@ -400,6 +225,7 @@ class GL:
                         
                         source_color = default_color_tuple
                         if mipmaps and all(uv is not None for uv in [uv0, uv1, uv2]):
+                            # Calculo da coordenada de textura interpolada
                             u = z_camera * (alpha*uv0[0]/z_cam0 + beta*uv1[0]/z_cam1 + gamma*uv2[0]/z_cam2)
                             v = z_camera * (alpha*uv0[1]/z_cam0 + beta*uv1[1]/z_cam1 + gamma*uv2[1]/z_cam2)
                             tex = mipmaps[mip_level]
@@ -408,6 +234,7 @@ class GL:
                             source_color = tex[max(0,min(h-1,tex_x)), max(0,min(w-1,tex_y))][:3]
 
                         elif c0 is not None:
+                            # Interpolacao Baricentrica 3D para cores
                             r = z_camera * (alpha*c0[0]/z_cam0 + beta*c1[0]/z_cam1 + gamma*c2[0]/z_cam2)
                             g = z_camera * (alpha*c0[1]/z_cam0 + beta*c1[1]/z_cam1 + gamma*c2[1]/z_cam2)
                             b = z_camera * (alpha*c0[2]/z_cam0 + beta*c1[2]/z_cam1 + gamma*c2[2]/z_cam2)
@@ -421,6 +248,7 @@ class GL:
                             gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
                         else: # Opaque
                             gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, source_color)
+                        gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [z_interp])
 
 
     @staticmethod
@@ -574,76 +402,6 @@ class GL:
         if not point or len(point) < 9:
             return
 
-        def transform_vertex(v):
-            """Transforms a single vertex and returns all necessary data."""
-            vec4 = np.array([v[0], v[1], v[2], 1.0])
-            
-            # --- THIS IS THE FIX ---
-            # The full transformation must include the model, view, and projection matrices.
-            world_pos_vec = GL.model_matrix @ vec4
-            view_pos_vec = GL.view_matrix @ world_pos_vec
-            clip_pos = GL.projection_matrix @ view_pos_vec
-            
-            world_pos = world_pos_vec[:3]
-            
-            w_clip = clip_pos[3] if clip_pos[3] != 0 else 1.0
-            ndc_pos = clip_pos / w_clip
-            
-            x = int(round((ndc_pos[0] * 0.5 + 0.5) * GL.render_width))
-            y = int(round((1.0 - (ndc_pos[1] * 0.5 + 0.5)) * GL.render_height))
-            
-            return (x, y, ndc_pos[2], w_clip, world_pos)
-
-        def draw_filled_triangle(p0, p1, p2, world_normal):
-            """Robust rasterizer with per-pixel lighting, z-buffer, and blending."""
-            (x0, y0, z0, w0, world0), (x1, y1, z1, w1, world1), (x2, y2, z2, w2, world2) = p0, p1, p2
-            
-            min_x = max(0, int(math.floor(min(x0,x1,x2))))
-            max_x = min(GL.render_width - 1, int(math.ceil(max(x0,x1,x2))))
-            min_y = max(0, int(math.floor(min(y0,y1,y2))))
-            max_y = min(GL.render_height - 1, int(math.ceil(max(y0,y1,y2))))
-
-            def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
-            area = edge(x0, y0, x1, y1, x2, y2)
-            if abs(area) < 1e-6: return
-
-            if area < 0:
-                p1, p2 = p2, p1 # Swap full data tuples
-                (x1, y1, z1, w1, world1) = p1
-                (x2, y2, z2, w2, world2) = p2
-                area = -area
-
-            for x in range(min_x, max_x + 1):
-                for y in range(min_y, max_y + 1):
-                    px, py = x + 0.5, y + 0.5
-                    wA = edge(x1, y1, x2, y2, px, py)
-                    wB = edge(x2, y2, x0, y0, px, py)
-                    wC = edge(x0, y0, x1, y1, px, py)
-
-                    if wA >= 0 and wB >= 0 and wC >= 0:
-                        alpha, beta, gamma = wA/area, wB/area, wC/area
-                        z_interp_ndc = alpha*z0 + beta*z1 + gamma*z2
-                        depth_val = (z_interp_ndc + 1.0) * 0.5
-                        current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-                        
-                        if depth_val < current_depth:
-                            world_pos_interp = alpha*world0 + beta*world1 + gamma*world2
-                            
-                            lit_color_float = GL._calculate_lighting(world_normal, world_pos_interp, colors)
-                            source_color = [int(c * 255) for c in lit_color_float]
-
-                            final_color = source_color
-                            if transparency > 0.0:
-                                alpha_val = 1.0 - transparency
-                                dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
-                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(source_color, dest_color)]
-                            
-                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
-                            gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
-
-        # --- MAIN LOGIC for triangleSet ---
-        transparency = colors.get("transparency", 0.0)
-
         for i in range(0, len(point), 9):
             v0, v1, v2 = point[i:i+3], point[i+3:i+6], point[i+6:i+9]
             
@@ -657,11 +415,11 @@ class GL:
                 world_normal = (GL.model_matrix[:3,:3] @ np.array(local_normal))
                 world_normal /= np.linalg.norm(world_normal)
             
-            p0_data = transform_vertex(v0)
-            p1_data = transform_vertex(v1)
-            p2_data = transform_vertex(v2)
+            p0_data = GL._transform_vertex(v0)
+            p1_data = GL._transform_vertex(v1)
+            p2_data = GL._transform_vertex(v2)
             
-            draw_filled_triangle(p0_data, p1_data, p2_data, world_normal.tolist())
+            GL._draw_triangle(p0_data, p1_data, p2_data, colors, world_normal.tolist())
 
 
     @staticmethod
@@ -717,7 +475,8 @@ class GL:
         """Pushes the current model matrix and applies a new local transformation."""
         GL.matrix_stack.append(GL.model_matrix.copy())
         
-        T = np.identity(4); T[:3, 3] = translation
+        T = np.identity(4)
+        T[:3, 3] = translation
         S = np.diag([scale[0], scale[1], scale[2], 1])
         
         x, y, z, angle = rotation
@@ -759,13 +518,7 @@ class GL:
 
         if not point or not stripCount: return
 
-        emissive_color = colors["emissiveColor"]
-        color_tuple = [c * 255 for c in emissive_color]
-        
         verts = [point[i:i+3] for i in range(0, len(point), 3)]
-        
-        full_transform = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix
-        view_model_transform = GL.view_matrix @ GL.model_matrix
         
         vert_idx = 0
         for count in stripCount:
@@ -776,31 +529,29 @@ class GL:
             for i in range(count - 2):
                 i0, i1, i2 = vert_idx + i, vert_idx + i + 1, vert_idx + i + 2
                 
-                # Ensure correct winding order for strips
+                # Ensure correct winding order for triangle strips
                 v_indices = (i0, i1, i2) if i % 2 == 0 else (i0, i2, i1)
                 
                 v0, v1, v2 = verts[v_indices[0]], verts[v_indices[1]], verts[v_indices[2]]
-                v0_h, v1_h, v2_h = np.array(v0+[1.0]), np.array(v1+[1.0]), np.array(v2+[1.0])
-
-                z_cam0 = -(view_model_transform @ v0_h)[2]
-                z_cam1 = -(view_model_transform @ v1_h)[2]
-                z_cam2 = -(view_model_transform @ v2_h)[2]
-                if z_cam0 < GL.near or z_cam1 < GL.near or z_cam2 < GL.near: continue
-
-                p0_clip, p1_clip, p2_clip = full_transform@v0_h, full_transform@v1_h, full_transform@v2_h
-
-                if p0_clip[3]==0 or p1_clip[3]==0 or p2_clip[3]==0: continue
-                p0_ndc, p1_ndc, p2_ndc = p0_clip/p0_clip[3], p1_clip/p1_clip[3], p2_clip/p2_clip[3]
-
-                sx0, sy0 = int((p0_ndc[0]+1)*0.5*GL.render_width), int((1-p0_ndc[1])*0.5*GL.render_height)
-                sx1, sy1 = int((p1_ndc[0]+1)*0.5*GL.render_width), int((1-p1_ndc[1])*0.5*GL.render_height)
-                sx2, sy2 = int((p2_ndc[0]+1)*0.5*GL.render_width), int((1-p2_ndc[1])*0.5*GL.render_height)
-
-                p0_final = (sx0, sy0, p0_ndc[2], p0_clip[3])
-                p1_final = (sx1, sy1, p1_ndc[2], p1_clip[3])
-                p2_final = (sx2, sy2, p2_ndc[2], p2_clip[3])
                 
-                GL._draw_triangle_simple(p0_final, p1_final, p2_final, color_tuple, 0)
+                # Calculate and transform the normal for this triangle
+                local_normal = GL._calculate_triangle_normal(v0, v1, v2)
+                try:
+                    upper_3x3 = GL.model_matrix[:3, :3]
+                    normal_transform = np.linalg.inv(upper_3x3).T
+                    world_normal = normal_transform @ np.array(local_normal)
+                    world_normal /= np.linalg.norm(world_normal)
+                except np.linalg.LinAlgError:
+                    world_normal = (GL.model_matrix[:3,:3] @ np.array(local_normal))
+                    world_normal /= np.linalg.norm(world_normal)
+                
+                # Transform vertices
+                p0_data = GL._transform_vertex(v0)
+                p1_data = GL._transform_vertex(v1)
+                p2_data = GL._transform_vertex(v2)
+
+                # Draw the triangle
+                GL._draw_triangle(p0_data, p1_data, p2_data, colors, world_normal.tolist())
 
             vert_idx += count
 
@@ -824,60 +575,8 @@ class GL:
         if not point or not index:
             return
 
-        # --- SETUP ---
-        transparency = colors.get("transparency", 0.0)
         verts = [point[i:i+3] for i in range(0, len(point), 3)]
-        
-        # --- NESTED HELPER FUNCTIONS ---
-        # (These helpers are identical to the ones in the corrected triangleSet)
 
-        def transform_vertex(v):
-            """Transforms a single vertex and returns all necessary data."""
-            vec4 = np.array([v[0], v[1], v[2], 1.0])
-            world_pos = (GL.model_matrix @ vec4)[:3]
-            clip_pos = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix @ vec4
-            w_clip = clip_pos[3] if clip_pos[3] != 0 else 1.0
-            ndc_pos = clip_pos / w_clip
-            x = int(round((ndc_pos[0] * 0.5 + 0.5) * GL.render_width))
-            y = int(round((1.0 - (ndc_pos[1] * 0.5 + 0.5)) * GL.render_height))
-            return (x, y, ndc_pos[2], w_clip, world_pos)
-
-        def draw_filled_triangle(p0, p1, p2, world_normal):
-            """Robust rasterizer with per-pixel lighting, z-buffer, and blending."""
-            (x0, y0, z0, w0, world0), (x1, y1, z1, w1, world1), (x2, y2, z2, w2, world2) = p0, p1, p2
-            min_x = max(0, int(math.floor(min(x0,x1,x2))))
-            max_x = min(GL.render_width - 1, int(math.ceil(max(x0,x1,x2))))
-            min_y = max(0, int(math.floor(min(y0,y1,y2))))
-            max_y = min(GL.render_height - 1, int(math.ceil(max(y0,y1,y2))))
-            def edge(ax, ay, bx, by, px, py): return (px-ax)*(by-ay)-(py-ay)*(bx-ax)
-            area = edge(x0, y0, x1, y1, x2, y2)
-            if abs(area) < 1e-6: return
-            if area < 0:
-                p1, p2 = p2, p1
-                (x1, y1, z1, w1, world1) = p1; (x2, y2, z2, w2, world2) = p2
-                area = -area
-            for x in range(min_x, max_x + 1):
-                for y in range(min_y, max_y + 1):
-                    px, py = x + 0.5, y + 0.5
-                    wA = edge(x1, y1, x2, y2, px, py); wB = edge(x2, y2, x0, y0, px, py); wC = edge(x0, y0, x1, y1, px, py)
-                    if wA >= 0 and wB >= 0 and wC >= 0:
-                        alpha, beta, gamma = wA/area, wB/area, wC/area
-                        z_interp_ndc = alpha*z0 + beta*z1 + gamma*z2
-                        depth_val = (z_interp_ndc + 1.0) * 0.5
-                        current_depth = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-                        if depth_val < current_depth:
-                            world_pos_interp = alpha*world0 + beta*world1 + gamma*world2
-                            lit_color_float = GL._calculate_lighting(world_normal, world_pos_interp, colors)
-                            source_color = [int(c * 255) for c in lit_color_float]
-                            final_color = source_color
-                            if transparency > 0.0:
-                                alpha_val = 1.0 - transparency
-                                dest_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
-                                final_color = [s*alpha_val + d*(1-alpha_val) for s,d in zip(source_color, dest_color)]
-                            gpu.GPU.draw_pixel([x,y], gpu.GPU.DEPTH_COMPONENT32F, [depth_val])
-                            gpu.GPU.draw_pixel([x,y], gpu.GPU.RGB8, final_color)
-
-        # --- MAIN LOGIC for indexedTriangleStripSet ---
         current_strip = []
         for idx in index:
             if idx == -1:
@@ -900,11 +599,11 @@ class GL:
                             world_normal = (GL.model_matrix[:3,:3] @ np.array(local_normal))
                             world_normal /= np.linalg.norm(world_normal)
                             
-                        p0_data = transform_vertex(v0)
-                        p1_data = transform_vertex(v1)
-                        p2_data = transform_vertex(v2)
+                        p0_data = GL._transform_vertex(v0)
+                        p1_data = GL._transform_vertex(v1)
+                        p2_data = GL._transform_vertex(v2)
 
-                        draw_filled_triangle(p0_data, p1_data, p2_data, world_normal.tolist())
+                        GL._draw_triangle(p0_data, p1_data, p2_data, colors, world_normal.tolist())
                 current_strip = []
             else:
                 current_strip.append(idx)
@@ -912,6 +611,27 @@ class GL:
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
                        texCoord, texCoordIndex, colors, current_texture):
+        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#IndexedFaceSet
+        # A função indexedFaceSet é usada para desenhar malhas de triângulos. Ela funciona de
+        # forma muito simular a IndexedTriangleStripSet porém com mais recursos.
+        # Você receberá as coordenadas dos pontos no parâmetro cord, esses
+        # pontos são uma lista de pontos x, y, e z sempre na ordem. Assim coord[0] é o valor
+        # da coordenada x do primeiro ponto, coord[1] o valor y do primeiro ponto, coord[2]
+        # o valor z da coordenada z do primeiro ponto. Já coord[3] é a coordenada x do
+        # segundo ponto e assim por diante. No IndexedFaceSet uma lista de vértices é informada
+        # em coordIndex, o valor -1 indica que a lista acabou.
+        # A ordem de conexão não possui uma ordem oficial, mas em geral se o primeiro ponto com os dois
+        # seguintes e depois este mesmo primeiro ponto com o terçeiro e quarto ponto. Por exemplo: numa
+        # sequencia 0, 1, 2, 3, 4, -1 o primeiro triângulo será com os vértices 0, 1 e 2, depois serão
+        # os vértices 0, 2 e 3, e depois 0, 3 e 4, e assim por diante, até chegar no final da lista.
+        # Adicionalmente essa implementação do IndexedFace aceita cores por vértices, assim
+        # se a flag colorPerVertex estiver habilitada, os vértices também possuirão cores
+        # que servem para definir a cor interna dos poligonos, para isso faça um cálculo
+        # baricêntrico de que cor deverá ter aquela posição. Da mesma forma se pode definir uma
+        # textura para o poligono, para isso, use as coordenadas de textura e depois aplique a
+        # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
+        # implementadado um método para a leitura de imagens.
+
         if not coord or not coordIndex: return
 
         verts = [coord[i:i+3] for i in range(0, len(coord), 3)]
@@ -932,6 +652,7 @@ class GL:
         mipmaps = None
         if current_texture and current_texture[0] and vert_tex_coords:
             try:
+                # Geracao da piramide de mipmaps
                 base_img = gpu.GPU.load_texture(current_texture[0])
                 mipmaps = [base_img]
                 while mipmaps[-1].shape[0] > 1 or mipmaps[-1].shape[1] > 1:
@@ -945,7 +666,6 @@ class GL:
             except Exception as e:
                 print(f"Could not load/process texture: {e}")
 
-        full_transform = GL.projection_matrix @ GL.view_matrix @ GL.model_matrix
         view_model_transform = GL.view_matrix @ GL.model_matrix
         
         for face in faces:
@@ -961,25 +681,16 @@ class GL:
                 z_cam2 = -(view_model_transform @ v2_h)[2]
                 if z_cam0 < GL.near or z_cam1 < GL.near or z_cam2 < GL.near: continue
 
-                p0_clip, p1_clip, p2_clip = full_transform@v0_h, full_transform@v1_h, full_transform@v2_h
-                
-                if p0_clip[3]==0 or p1_clip[3]==0 or p2_clip[3]==0: continue
-                p0_ndc, p1_ndc, p2_ndc = p0_clip/p0_clip[3], p1_clip/p1_clip[3], p2_clip/p2_clip[3]
-                
-                sx0, sy0 = int((p0_ndc[0]+1)*0.5*GL.render_width), int((1-p0_ndc[1])*0.5*GL.render_height)
-                sx1, sy1 = int((p1_ndc[0]+1)*0.5*GL.render_width), int((1-p1_ndc[1])*0.5*GL.render_height)
-                sx2, sy2 = int((p2_ndc[0]+1)*0.5*GL.render_width), int((1-p2_ndc[1])*0.5*GL.render_height)
-                
-                p0_final = (sx0, sy0, p0_ndc[2], p0_clip[3])
-                p1_final = (sx1, sy1, p1_ndc[2], p1_clip[3])
-                p2_final = (sx2, sy2, p2_ndc[2], p2_clip[3])
+                p0_final = GL._transform_vertex(v0)[:-1]
+                p1_final = GL._transform_vertex(v1)[:-1]
+                p2_final = GL._transform_vertex(v2)[:-1]
 
-                c0,c1,c2 = (None,None,None)
+                c0, c1, c2 = (None,None,None)
                 if vert_colors:
-                    c0,c1,c2 = vert_colors[p0_idx], vert_colors[p1_idx], vert_colors[p2_idx]
+                    c0, c1, c2 = vert_colors[p0_idx], vert_colors[p1_idx], vert_colors[p2_idx]
                 uv0,uv1,uv2 = (None,None,None)
                 if vert_tex_coords:
-                    uv0,uv1,uv2 = vert_tex_coords[p0_idx], vert_tex_coords[p1_idx], vert_tex_coords[p2_idx]
+                    uv0, uv1, uv2 = vert_tex_coords[p0_idx], vert_tex_coords[p1_idx], vert_tex_coords[p2_idx]
                 
                 GL._draw_triangle_pipeline(p0_final, p1_final, p2_final, c0, c1, c2, uv0, uv1, uv2, z_cam0, z_cam1, z_cam2, mipmaps, default_color_tuple, transparency)
 
